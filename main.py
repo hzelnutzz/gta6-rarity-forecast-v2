@@ -62,24 +62,43 @@ def estimate_players(history, target_time):
         if players is not None and players > 0:
             samples.append((parse_time(item["slot"]), float(players)))
     if not samples:
-        return 1.0
+        return 1.0, 1.0
 
     origin = samples[0][0]
     xs = [(slot - origin).total_seconds() / 3600.0 for slot, _ in samples]
     target_hours = (target_time - origin).total_seconds() / 3600.0
     ys = [math.log(players) for _, players in samples]
-    if len(set(ys)) == 1:
-        days_after_last = max(0.0, (target_time - samples[-1][0]).total_seconds() / 86400.0)
-        return samples[-1][1] * (1.5 ** days_after_last)
-
     fit = linear_fit(xs, ys)
-    if fit is None:
-        return samples[-1][1]
+    if len(set(ys)) == 1 or fit is None:
+        days_after_last = max(0.0, (target_time - samples[-1][0]).total_seconds() / 86400.0)
+        growth = 1.5 ** days_after_last
+        return samples[-1][1] * growth, growth
+
     intercept, slope = fit
     try:
-        return max(1.0, math.exp(intercept + slope * target_hours))
+        players_hat = max(1.0, math.exp(intercept + slope * target_hours))
     except OverflowError:
-        return float("inf")
+        players_hat = float("inf")
+    growth = players_hat / samples[-1][1]
+    return players_hat, growth
+
+
+def last_refresh(history):
+    previous_players = None
+    refresh_time = None
+    refresh_change = 0.0
+    for item in history:
+        players = item.get("players_tracked")
+        if players is None or players <= 0:
+            continue
+        players = float(players)
+        if previous_players is not None:
+            change = players / previous_players - 1.0
+            if abs(change) > 0.01:
+                refresh_time = parse_time(item["slot"])
+                refresh_change = abs(change)
+        previous_players = players
+    return refresh_time, refresh_change
 
 
 def forecast_earners(reads, target_time, at_time):
@@ -108,11 +127,22 @@ def forecast_earners(reads, target_time, at_time):
 def persistence_result(trophy, rate, horizon_days):
     if rate is None:
         return {"id": trophy.get("id"), "q": quantiles(MIN_PCT, 2.0)}
-    spread = 0.9 * math.sqrt(max(0.0, horizon_days))
+    spread = 1.2 * math.sqrt(max(0.0, horizon_days))
     return {"id": trophy.get("id"), "q": quantiles(rate, spread)}
 
 
-def forecast_trophy(trophy, trophy_index, history, target_time, at_time, players_hat, horizon_days):
+def forecast_trophy(
+    trophy,
+    trophy_index,
+    history,
+    target_time,
+    at_time,
+    players_hat,
+    players_growth,
+    horizon_days,
+    refresh_time,
+    refresh_change,
+):
     if not history:
         return persistence_result(trophy, None, horizon_days)
 
@@ -132,12 +162,22 @@ def forecast_trophy(trophy, trophy_index, history, target_time, at_time, players
     if not reads:
         return persistence_result(trophy, None, horizon_days)
 
-    earners_hat = forecast_earners(reads, target_time, at_time)
+    trend_reads = reads
+    if refresh_time is not None:
+        post_refresh_reads = [read for read in reads if read[0] >= refresh_time]
+        if len(post_refresh_reads) >= 3:
+            trend_reads = post_refresh_reads
+
+    earners_hat = forecast_earners(trend_reads, target_time, at_time)
     median = clamp_pct(100.0 * earners_hat / players_hat)
+    last_rate = reads[-1][1]
+    if refresh_change <= 0.10:
+        median = min(3.0 * last_rate, max(0.5 * last_rate, median))
+        median = clamp_pct(median)
 
     logit_points = [
         ((slot_time - at_time).total_seconds() / 3600.0, logit_pct(rate))
-        for slot_time, rate, _ in reads
+        for slot_time, rate, _ in trend_reads
     ]
     residual_spread = 0.0
     if len(set(logit_points)) >= 3:
@@ -147,8 +187,13 @@ def forecast_trophy(trophy, trophy_index, history, target_time, at_time, players
             residuals = [value - (intercept + slope * hour) for hour, value in logit_points]
             residual_spread = math.sqrt(sum(residual * residual for residual in residuals) / len(residuals))
 
-    walk_spread = 0.9 * math.sqrt(max(0.0, horizon_days))
-    spread = math.sqrt(walk_spread * walk_spread + residual_spread * residual_spread)
+    base_spread = 1.2 * math.sqrt(max(0.0, horizon_days))
+    dilution_spread = max(0.0, math.log(max(1.0, players_growth)))
+    spread = math.sqrt(
+        base_spread * base_spread
+        + dilution_spread * dilution_spread
+        + residual_spread * residual_spread
+    )
     return {"id": trophy.get("id"), "q": quantiles(median, spread)}
 
 
@@ -158,7 +203,8 @@ def forecast_case(case):
     at_time = parse_time(case["at"])
     target_time = parse_time(case["target"])
     horizon_days = max(0.0, float(case.get("horizon_minutes", 0.0)) / 1440.0)
-    players_hat = estimate_players(history, target_time)
+    players_hat, players_growth = estimate_players(history, target_time)
+    refresh_time, refresh_change = last_refresh(history)
 
     forecasts = []
     for index, trophy in enumerate(trophies):
@@ -181,7 +227,10 @@ def forecast_case(case):
                     target_time,
                     at_time,
                     players_hat,
+                    players_growth,
                     horizon_days,
+                    refresh_time,
+                    refresh_change,
                 )
             )
         except Exception:
