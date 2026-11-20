@@ -1,0 +1,1 @@
+{"id":"smoke","at":"2026-11-20T12:00:00Z","horizon_minutes":1440,"target":"2026-11-21T12:00:00Z","trophies":[{"id":"common"},{"id":"rare"}],"history":[{"slot":"2026-11-20T00:00:00Z","players_tracked":10000,"trophies_earned":1000,"rates":[10.0,1.0]},{"slot":"2026-11-20T12:00:00Z","players_tracked":11000,"trophies_earned":1200,"rates":[10.5,1.1]}]}
